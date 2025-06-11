@@ -211,7 +211,7 @@ export default function ManageStudents() {
                 <XCircle className="h-6 w-6 text-white" />
               </div>
               <div className="text-3xl font-bold text-red-600 mb-1">
-                {students.length - Object.keys(attendanceData).length}
+                {students.length - Object.values(attendanceData).filter(a => a.status === 'present').length}
               </div>
               <div className="text-sm font-medium text-red-700">Absent</div>
             </div>

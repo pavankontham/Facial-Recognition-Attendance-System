@@ -93,17 +93,49 @@ supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "eyJhbGciOiJIUzI1NiIsInR5c
 
 # Create Supabase client - now that schema is set up, it should work
 try:
-    # Create client without options to avoid compatibility issues
-    supabase = create_client(supabase_url, supabase_key)
+    # Create a custom Supabase client that bypasses GoTrue authentication issues
+    from postgrest import SyncPostgrestClient
+
+    class CustomSupabaseClient:
+        def __init__(self, url, key):
+            self.url = url
+            self.key = key
+            # Create PostgREST client directly for database operations
+            self.rest_url = f"{url}/rest/v1"
+            self.headers = {
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            }
+            self.postgrest = SyncPostgrestClient(self.rest_url, headers=self.headers)
+
+        def table(self, table_name):
+            return self.postgrest.table(table_name)
+
+    # Create our custom client
+    supabase = CustomSupabaseClient(supabase_url, supabase_key)
+
     # Test the connection with a simple query
-    test_result = supabase.table("users").select("count", count="exact").execute()
+    test_result = supabase.table("users").select("*").limit(1).execute()
     SUPABASE_AVAILABLE = True
-    print("✅ Supabase connected successfully!")
+    print("✅ Supabase connected successfully with custom client!")
 except Exception as e:
-    print(f"❌ Supabase connection failed: {e}")
-    print("Running in demo mode without database")
-    supabase = None
-    SUPABASE_AVAILABLE = False
+    print(f"❌ Custom Supabase connection failed: {e}")
+    print("Trying fallback method...")
+
+    try:
+        # Fallback: Try the original create_client with error handling
+        supabase = create_client(supabase_url, supabase_key)
+        # Simple test
+        test_result = supabase.table("users").select("*").limit(1).execute()
+        SUPABASE_AVAILABLE = True
+        print("✅ Supabase connected successfully with fallback!")
+    except Exception as e2:
+        print(f"❌ All connection methods failed: {e2}")
+        print("Running in demo mode without database")
+        supabase = None
+        SUPABASE_AVAILABLE = False
 
 # Create directories
 os.makedirs("temp", exist_ok=True)
@@ -578,7 +610,7 @@ async def get_face_encoding(firebase_id: str):
 
 @app.post("/api/attendance")
 async def mark_attendance(attendance_data: dict):
-    """Mark attendance for a user"""
+    """Mark attendance for a user (DEPRECATED - Use mark-manual instead)"""
     if not SUPABASE_AVAILABLE:
         return {
             "success": False,
@@ -587,7 +619,15 @@ async def mark_attendance(attendance_data: dict):
 
     try:
         firebase_id = attendance_data.get("firebase_id")
+        class_id = attendance_data.get("class_id")
+        slot_number = attendance_data.get("slot_number", 1)
         status = attendance_data.get("status", "present")
+
+        if not firebase_id or not class_id:
+            return {
+                "success": False,
+                "message": "Missing required fields: firebase_id and class_id"
+            }
 
         # Get user's database ID
         user_result = supabase.table("users").select("id").eq("firebase_id", firebase_id).execute()
@@ -601,22 +641,27 @@ async def mark_attendance(attendance_data: dict):
         db_user_id = user_result.data[0]["id"]
         ist_now = get_ist_now()
         today = ist_now.date().isoformat()
+        day_of_week = ist_now.weekday() + 1
 
-        # Check if attendance already marked today
-        existing_result = supabase.table("attendance").select("*").eq("user_id", db_user_id).eq("date", today).execute()
+        # Check if attendance already marked for this class and slot today
+        existing_result = supabase.table("attendance").select("*").eq("student_id", db_user_id).eq("class_id", class_id).eq("slot_number", slot_number).eq("attendance_date", today).execute()
 
         if existing_result.data:
             return {
                 "success": False,
-                "message": "Attendance already marked today"
+                "message": f"Attendance already marked for this class and slot today"
             }
 
-        # Mark attendance
+        # Mark attendance with class-wise structure
         attendance_result = supabase.table("attendance").insert({
-            "user_id": db_user_id,
-            "date": today,
+            "student_id": db_user_id,
+            "class_id": class_id,
+            "slot_number": slot_number,
+            "day_of_week": day_of_week,
+            "attendance_date": today,
             "status": status,
-            "timestamp": ist_now.isoformat()
+            "marked_by": "api",
+            "created_at": ist_now.isoformat()
         }).execute()
 
         return {
@@ -786,6 +831,378 @@ async def get_all_attendance(start_date: str = None, end_date: str = None, teach
         return {
             "success": False,
             "message": f"Database error: {str(e)}"
+        }
+
+@app.get("/api/analytics/class-wise")
+async def get_class_wise_analytics(teacher_firebase_id: str, start_date: str = None, end_date: str = None):
+    """Get comprehensive class-wise attendance analytics for teachers"""
+    if not SUPABASE_AVAILABLE:
+        return {
+            "success": False,
+            "message": "Database not available"
+        }
+
+    try:
+        # Get teacher's database ID
+        teacher_result = supabase.table("users").select("id").eq("firebase_id", teacher_firebase_id).execute()
+        if not teacher_result.data:
+            return {"success": False, "message": "Teacher not found"}
+
+        teacher_id = teacher_result.data[0]["id"]
+
+        # Get teacher's classes with student counts
+        classes_result = supabase.table("classes").select("*").eq("teacher_id", teacher_id).execute()
+        teacher_classes = classes_result.data or []
+
+        # Get attendance data for teacher's classes
+        attendance_query = supabase.table("attendance").select("*")
+        if start_date:
+            attendance_query = attendance_query.gte("attendance_date", start_date)
+        if end_date:
+            attendance_query = attendance_query.lte("attendance_date", end_date)
+
+        # Filter by teacher's classes
+        teacher_class_ids = [cls["id"] for cls in teacher_classes]
+        if teacher_class_ids:
+            attendance_query = attendance_query.in_("class_id", teacher_class_ids)
+        else:
+            return {"success": True, "data": {"classes": [], "overall_stats": {}}}
+
+        attendance_result = attendance_query.execute()
+        attendance_data = attendance_result.data or []
+
+        # Process analytics for each class
+        class_analytics = []
+        overall_stats = {
+            "total_classes": len(teacher_classes),
+            "total_students": 0,
+            "total_attendance_records": len(attendance_data),
+            "overall_attendance_rate": 0,
+            "best_performing_class": None,
+            "worst_performing_class": None
+        }
+
+        for class_info in teacher_classes:
+            class_id = class_info["id"]
+
+            # Get students enrolled in this class
+            enrollment_result = supabase.table("class_enrollments").select("student_id").eq("class_id", class_id).eq("status", "approved").execute()
+            enrolled_students = len(enrollment_result.data or [])
+            overall_stats["total_students"] += enrolled_students
+
+            # Get attendance for this class
+            class_attendance = [record for record in attendance_data if record["class_id"] == class_id]
+
+            # Calculate class statistics
+            total_records = len(class_attendance)
+            present_records = len([r for r in class_attendance if r["status"] == "present"])
+            attendance_rate = round((present_records / total_records) * 100) if total_records > 0 else 0
+
+            # Slot-wise breakdown
+            slot_stats = {}
+            for slot in range(1, 10):  # 9 slots
+                slot_records = [r for r in class_attendance if r["slot_number"] == slot]
+                slot_present = len([r for r in slot_records if r["status"] == "present"])
+                slot_total = len(slot_records)
+                slot_rate = round((slot_present / slot_total) * 100) if slot_total > 0 else 0
+                slot_stats[f"slot_{slot}"] = {
+                    "total": slot_total,
+                    "present": slot_present,
+                    "rate": slot_rate
+                }
+
+            # Daily breakdown
+            daily_stats = {}
+            for record in class_attendance:
+                date = record["attendance_date"]
+                if date not in daily_stats:
+                    daily_stats[date] = {"total": 0, "present": 0}
+                daily_stats[date]["total"] += 1
+                if record["status"] == "present":
+                    daily_stats[date]["present"] += 1
+
+            # Convert daily stats to list with rates
+            daily_breakdown = []
+            for date, stats in daily_stats.items():
+                rate = round((stats["present"] / stats["total"]) * 100) if stats["total"] > 0 else 0
+                daily_breakdown.append({
+                    "date": date,
+                    "total": stats["total"],
+                    "present": stats["present"],
+                    "rate": rate
+                })
+            daily_breakdown.sort(key=lambda x: x["date"])
+
+            class_analytics.append({
+                "class_id": class_id,
+                "class_name": class_info["name"],
+                "subject": class_info["subject"],
+                "enrolled_students": enrolled_students,
+                "total_records": total_records,
+                "present_records": present_records,
+                "attendance_rate": attendance_rate,
+                "slot_breakdown": slot_stats,
+                "daily_breakdown": daily_breakdown
+            })
+
+        # Calculate overall attendance rate
+        total_present = sum([cls["present_records"] for cls in class_analytics])
+        total_records = sum([cls["total_records"] for cls in class_analytics])
+        overall_stats["overall_attendance_rate"] = round((total_present / total_records) * 100) if total_records > 0 else 0
+
+        # Find best and worst performing classes
+        if class_analytics:
+            best_class = max(class_analytics, key=lambda x: x["attendance_rate"])
+            worst_class = min(class_analytics, key=lambda x: x["attendance_rate"])
+            overall_stats["best_performing_class"] = {
+                "name": best_class["class_name"],
+                "rate": best_class["attendance_rate"]
+            }
+            overall_stats["worst_performing_class"] = {
+                "name": worst_class["class_name"],
+                "rate": worst_class["attendance_rate"]
+            }
+
+        return {
+            "success": True,
+            "data": {
+                "classes": class_analytics,
+                "overall_stats": overall_stats
+            }
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
+
+@app.get("/api/attendance/summary")
+async def get_attendance_summary(teacher_firebase_id: str = None, class_id: int = None, date: str = None):
+    """Get attendance summary for a specific class, date, or teacher"""
+    if not SUPABASE_AVAILABLE:
+        return {
+            "success": False,
+            "message": "Database not available"
+        }
+
+    try:
+        # Build base query
+        query = supabase.table("attendance").select("*")
+
+        # Apply filters
+        if date:
+            query = query.eq("attendance_date", date)
+        if class_id:
+            query = query.eq("class_id", class_id)
+
+        # If teacher_firebase_id is provided, filter by teacher's classes
+        if teacher_firebase_id:
+            teacher_result = supabase.table("users").select("id").eq("firebase_id", teacher_firebase_id).execute()
+            if teacher_result.data:
+                teacher_id = teacher_result.data[0]["id"]
+                teacher_classes = supabase.table("classes").select("id").eq("teacher_id", teacher_id).execute()
+                teacher_class_ids = [cls["id"] for cls in teacher_classes.data or []]
+                if teacher_class_ids:
+                    query = query.in_("class_id", teacher_class_ids)
+                else:
+                    return {"success": True, "data": {"summary": [], "stats": {}}}
+
+        result = query.execute()
+        attendance_records = result.data or []
+
+        # Group by class and slot
+        summary = {}
+        for record in attendance_records:
+            class_id = record["class_id"]
+            slot_number = record["slot_number"]
+
+            # Get class info if not already cached
+            if class_id not in summary:
+                class_result = supabase.table("classes").select("id, name, subject").eq("id", class_id).execute()
+                class_info = class_result.data[0] if class_result.data else {"name": "Unknown", "subject": "Unknown"}
+
+                # Get enrolled students count
+                enrollment_result = supabase.table("class_enrollments").select("id").eq("class_id", class_id).eq("status", "approved").execute()
+                enrolled_count = len(enrollment_result.data or [])
+
+                summary[class_id] = {
+                    "class_id": class_id,
+                    "class_name": class_info["name"],
+                    "subject": class_info["subject"],
+                    "enrolled_students": enrolled_count,
+                    "slots": {}
+                }
+
+            # Initialize slot if not exists
+            if slot_number not in summary[class_id]["slots"]:
+                summary[class_id]["slots"][slot_number] = {
+                    "slot_number": slot_number,
+                    "total_marked": 0,
+                    "present": 0,
+                    "absent": 0,
+                    "attendance_rate": 0,
+                    "students": []
+                }
+
+            # Add student info
+            student_result = supabase.table("users").select("id, name, student_id").eq("id", record["student_id"]).execute()
+            student_info = student_result.data[0] if student_result.data else {"name": "Unknown", "student_id": "N/A"}
+
+            summary[class_id]["slots"][slot_number]["students"].append({
+                "student_id": record["student_id"],
+                "student_name": student_info["name"],
+                "student_roll_id": student_info["student_id"],
+                "status": record["status"],
+                "marked_by": record["marked_by"],
+                "created_at": record["created_at"]
+            })
+
+            # Update counts
+            summary[class_id]["slots"][slot_number]["total_marked"] += 1
+            if record["status"] == "present":
+                summary[class_id]["slots"][slot_number]["present"] += 1
+            else:
+                summary[class_id]["slots"][slot_number]["absent"] += 1
+
+        # Calculate attendance rates and convert to list
+        summary_list = []
+        total_students = 0
+        total_present = 0
+        total_marked = 0
+
+        for class_data in summary.values():
+            for slot_data in class_data["slots"].values():
+                if slot_data["total_marked"] > 0:
+                    slot_data["attendance_rate"] = round((slot_data["present"] / slot_data["total_marked"]) * 100)
+                total_marked += slot_data["total_marked"]
+                total_present += slot_data["present"]
+
+            total_students += class_data["enrolled_students"]
+            summary_list.append(class_data)
+
+        # Overall statistics
+        overall_stats = {
+            "total_classes": len(summary_list),
+            "total_enrolled_students": total_students,
+            "total_marked_attendance": total_marked,
+            "total_present": total_present,
+            "overall_attendance_rate": round((total_present / total_marked) * 100) if total_marked > 0 else 0
+        }
+
+        return {
+            "success": True,
+            "data": {
+                "summary": summary_list,
+                "stats": overall_stats
+            }
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Database error: {str(e)}"
+        }
+
+@app.post("/api/test/create-sample-data")
+async def create_sample_data():
+    """Create sample data for testing (DEVELOPMENT ONLY)"""
+    if not SUPABASE_AVAILABLE:
+        return {
+            "success": False,
+            "message": "Database not available"
+        }
+
+    try:
+        # Create sample teacher
+        teacher_data = {
+            "firebase_id": "test_teacher_123",
+            "name": "Dr. John Teacher",
+            "email": "teacher@test.com",
+            "role": "teacher",
+            "subject": "Computer Science"
+        }
+
+        teacher_result = supabase.table("users").upsert(teacher_data).execute()
+        teacher_id = teacher_result.data[0]["id"] if teacher_result.data else None
+
+        # Create sample student
+        student_data = {
+            "firebase_id": "test_student_123",
+            "name": "Alice Student",
+            "email": "student@test.com",
+            "role": "student",
+            "student_id": "CS001"
+        }
+
+        student_result = supabase.table("users").upsert(student_data).execute()
+        student_id = student_result.data[0]["id"] if student_result.data else None
+
+        # Create sample class
+        if teacher_id:
+            class_data = {
+                "name": "Data Structures",
+                "subject": "Computer Science",
+                "teacher_id": teacher_id,
+                "description": "Introduction to Data Structures and Algorithms"
+            }
+
+            class_result = supabase.table("classes").upsert(class_data).execute()
+            class_id = class_result.data[0]["id"] if class_result.data else None
+
+            # Enroll student in class
+            if student_id and class_id:
+                enrollment_data = {
+                    "student_id": student_id,
+                    "class_id": class_id,
+                    "status": "approved"
+                }
+                supabase.table("class_enrollments").upsert(enrollment_data).execute()
+
+                # Create sample attendance records
+                today = get_ist_now().date()
+                yesterday = today - timedelta(days=1)
+
+                attendance_records = [
+                    {
+                        "student_id": student_id,
+                        "class_id": class_id,
+                        "slot_number": 1,
+                        "day_of_week": today.weekday() + 1,
+                        "attendance_date": today.isoformat(),
+                        "status": "present",
+                        "marked_by": "test",
+                        "created_at": get_ist_now().isoformat()
+                    },
+                    {
+                        "student_id": student_id,
+                        "class_id": class_id,
+                        "slot_number": 2,
+                        "day_of_week": yesterday.weekday() + 1,
+                        "attendance_date": yesterday.isoformat(),
+                        "status": "present",
+                        "marked_by": "test",
+                        "created_at": (get_ist_now() - timedelta(days=1)).isoformat()
+                    }
+                ]
+
+                for record in attendance_records:
+                    supabase.table("attendance").upsert(record).execute()
+
+        return {
+            "success": True,
+            "message": "Sample data created successfully",
+            "data": {
+                "teacher_firebase_id": "test_teacher_123",
+                "student_firebase_id": "test_student_123",
+                "class_id": class_id if 'class_id' in locals() else None
+            }
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error creating sample data: {str(e)}"
         }
 
 @app.get("/health")
@@ -1938,7 +2355,7 @@ async def generate_instant_password(request_data: dict):
                 "success": True,
                 "data": {
                     "password": password,
-                    "expires_at": (datetime.now() + timedelta(minutes=3)).isoformat(),
+                    "expires_at": (get_ist_now() + timedelta(minutes=3)).isoformat(),
                     "class_id": class_id
                 },
                 "message": "Instant password generated (demo mode)"
@@ -2207,7 +2624,7 @@ async def mark_instant_attendance(request_data: dict):
         password_data = instant_passwords[password]
 
         # Check if password has expired
-        if datetime.now() > password_data["expires_at"]:
+        if get_ist_now() > password_data["expires_at"]:
             # Clean up expired password
             try:
                 del instant_passwords[password]
@@ -2279,8 +2696,20 @@ async def mark_instant_attendance(request_data: dict):
             return {"success": False, "message": "Error checking existing attendance. Please try again."}
 
         if existing_attendance.data:
-            existing_time = datetime.fromisoformat(existing_attendance.data[0]["created_at"].replace('Z', '+00:00'))
-            return {"success": False, "message": f"Attendance already marked for slot {slot_number} today at {existing_time.strftime('%I:%M %p')}"}
+            existing_time_str = existing_attendance.data[0]["created_at"]
+            # Handle timezone conversion properly
+            if existing_time_str.endswith('Z'):
+                existing_time = datetime.fromisoformat(existing_time_str.replace('Z', '+00:00'))
+            else:
+                existing_time = datetime.fromisoformat(existing_time_str)
+
+            # Convert to IST for display
+            if existing_time.tzinfo is not None:
+                existing_time_ist = existing_time.astimezone(IST)
+            else:
+                existing_time_ist = IST.localize(existing_time)
+
+            return {"success": False, "message": f"Attendance already marked for slot {slot_number} today at {existing_time_ist.strftime('%I:%M %p')}"}
 
         # Mark attendance
         attendance_data = {

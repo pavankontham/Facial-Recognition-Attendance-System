@@ -18,6 +18,7 @@ export default function StudentDashboard() {
       percentage: 0
     }
   });
+  const [classWiseData, setClassWiseData] = useState([]);
   const [profilePhoto, setProfilePhoto] = useState(null);
   const [loading, setLoading] = useState(true);
 
@@ -34,16 +35,45 @@ export default function StudentDashboard() {
       const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
       const monthAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
+      console.log('🔍 Fetching attendance data for student:', currentUser.uid);
+      console.log('📅 Date range:', { today, weekAgo, monthAgo });
+
       // Get today's attendance - Use Firebase ID (currentUser.uid) instead of database ID
-      const { data: todayData } = await dbHelpers.getAttendanceByUser(currentUser.uid, today, today);
+      const { data: todayData, error: todayError } = await dbHelpers.getAttendanceByUser(currentUser.uid, today, today);
+      console.log('📊 Today\'s attendance data:', { todayData, todayError });
 
       // Get this week's attendance
-      const { data: weekData } = await dbHelpers.getAttendanceByUser(currentUser.uid, weekAgo, today);
+      const { data: weekData, error: weekError } = await dbHelpers.getAttendanceByUser(currentUser.uid, weekAgo, today);
+      console.log('📊 Week\'s attendance data:', { weekData, weekError });
 
       // Get this month's attendance
-      const { data: monthData } = await dbHelpers.getAttendanceByUser(currentUser.uid, monthAgo, today);
+      const { data: monthData, error: monthError } = await dbHelpers.getAttendanceByUser(currentUser.uid, monthAgo, today);
+      console.log('📊 Month\'s attendance data:', { monthData, monthError });
 
-      // Calculate stats
+      // Get student's classes for class-wise breakdown
+      const { data: studentClasses } = await dbHelpers.getClassesByStudent(currentUser.uid);
+
+      // Calculate class-wise attendance
+      const classWiseAttendance = [];
+      if (studentClasses && monthData) {
+        for (const classItem of studentClasses) {
+          const classAttendance = monthData.filter(record => record.class_id === classItem.id);
+          const presentCount = classAttendance.filter(record => record.status === 'present').length;
+          const totalCount = classAttendance.length;
+          const attendanceRate = totalCount > 0 ? Math.round((presentCount / totalCount) * 100) : 0;
+
+          classWiseAttendance.push({
+            ...classItem,
+            present: presentCount,
+            total: totalCount,
+            attendanceRate
+          });
+        }
+      }
+
+      setClassWiseData(classWiseAttendance);
+
+      // Calculate overall stats
       const presentDays = monthData?.filter(record => record.status === 'present').length || 0;
       const absentDays = monthData?.filter(record => record.status === 'absent').length || 0;
       const totalDays = monthData?.length || 0;
@@ -147,7 +177,10 @@ export default function StudentDashboard() {
               <div className="ml-4 flex-1">
                 <p className="text-lg font-semibold text-green-800">Present</p>
                 <p className="text-green-600">
-                  Marked at {new Date(attendanceData.today.timestamp).toLocaleTimeString()}
+                  Marked at {new Date(attendanceData.today.created_at || attendanceData.today.timestamp).toLocaleTimeString()}
+                </p>
+                <p className="text-sm text-green-500">
+                  Class: {attendanceData.today.class_name} • Slot {attendanceData.today.slot_number}
                 </p>
               </div>
               <div className="text-right">
@@ -155,18 +188,23 @@ export default function StudentDashboard() {
               </div>
             </div>
           ) : (
-            <div className="flex items-center p-6 bg-gradient-to-r from-red-50 to-rose-50 border border-red-200 rounded-xl">
+            <div className="flex items-center p-6 bg-gradient-to-r from-yellow-50 to-amber-50 border border-yellow-200 rounded-xl">
               <div className="flex-shrink-0">
-                <div className="w-12 h-12 bg-red-500 rounded-full flex items-center justify-center">
-                  <XCircle className="h-6 w-6 text-white" />
+                <div className="w-12 h-12 bg-yellow-500 rounded-full flex items-center justify-center">
+                  <Clock className="h-6 w-6 text-white" />
                 </div>
               </div>
               <div className="ml-4 flex-1">
-                <p className="text-lg font-semibold text-red-800">Not Marked</p>
-                <p className="text-red-600">You haven't marked attendance today</p>
+                <p className="text-lg font-semibold text-yellow-800">No Attendance Today</p>
+                <p className="text-yellow-600">
+                  {attendanceData.stats.total === 0
+                    ? "You haven't marked any attendance yet. Start by joining classes and marking attendance!"
+                    : "You haven't marked attendance today. Check if you have any classes scheduled."
+                  }
+                </p>
               </div>
               <div className="text-right">
-                <Link href="/student/instant-attendance" className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition-colors">
+                <Link href="/student/instant-attendance" className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors">
                   Mark Now
                 </Link>
               </div>
@@ -260,6 +298,58 @@ export default function StudentDashboard() {
           </div>
         </div>
 
+        {/* Class-wise Attendance */}
+        {classWiseData.length > 0 && (
+          <div className="card">
+            <h2 className="text-xl font-semibold text-gray-900 mb-4">Class-wise Attendance (This Month)</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {classWiseData.map((classItem) => (
+                <div key={classItem.id} className="bg-gradient-to-br from-gray-50 to-gray-100 rounded-xl p-4 border border-gray-200">
+                  <div className="flex items-center justify-between mb-3">
+                    <div>
+                      <h3 className="font-semibold text-gray-900 truncate">{classItem.name}</h3>
+                      <p className="text-xs text-gray-600">{classItem.subject}</p>
+                    </div>
+                    <span className={`px-2 py-1 rounded-full text-xs font-medium ${
+                      classItem.attendanceRate >= 80 ? 'bg-green-100 text-green-800' :
+                      classItem.attendanceRate >= 60 ? 'bg-yellow-100 text-yellow-800' :
+                      'bg-red-100 text-red-800'
+                    }`}>
+                      {classItem.attendanceRate}%
+                    </span>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Present:</span>
+                      <span className="font-medium text-green-600">{classItem.present}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Total Classes:</span>
+                      <span className="font-medium text-gray-900">{classItem.total}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Teacher:</span>
+                      <span className="font-medium text-blue-600">{classItem.teacher_name}</span>
+                    </div>
+                  </div>
+                  <div className="mt-3">
+                    <div className="w-full bg-gray-200 rounded-full h-2">
+                      <div
+                        className={`h-2 rounded-full transition-all duration-500 ${
+                          classItem.attendanceRate >= 80 ? 'bg-green-500' :
+                          classItem.attendanceRate >= 60 ? 'bg-yellow-500' :
+                          'bg-red-500'
+                        }`}
+                        style={{ width: `${classItem.attendanceRate}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Recent Attendance */}
         <div className="card">
           <h2 className="text-xl font-semibold text-gray-900 mb-4">Recent Attendance</h2>
@@ -289,7 +379,24 @@ export default function StudentDashboard() {
               ))}
             </div>
           ) : (
-            <p className="text-gray-600">No attendance records found.</p>
+            <div className="text-center py-8">
+              <Calendar className="h-12 w-12 text-gray-400 mx-auto mb-4" />
+              <p className="text-gray-600 mb-2">No attendance records found.</p>
+              <div className="text-sm text-gray-500 space-y-1">
+                <p>To start tracking attendance:</p>
+                <p>1. Join classes using class codes from your teachers</p>
+                <p>2. Mark attendance using face recognition or instant passwords</p>
+                <p>3. Your attendance history will appear here</p>
+              </div>
+              <div className="mt-4 space-x-2">
+                <Link href="/student/classes" className="inline-block bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors text-sm">
+                  Join Classes
+                </Link>
+                <Link href="/student/instant-attendance" className="inline-block bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition-colors text-sm">
+                  Mark Attendance
+                </Link>
+              </div>
+            </div>
           )}
         </div>
       </div>

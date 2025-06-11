@@ -12,8 +12,11 @@ export default function AttendanceReports() {
   const [filters, setFilters] = useState({
     startDate: '',
     endDate: '',
-    studentId: ''
+    studentId: '',
+    classId: '',
+    slotNumber: ''
   });
+  const [teacherClasses, setTeacherClasses] = useState([]);
   const [stats, setStats] = useState({
     totalRecords: 0,
     presentCount: 0,
@@ -35,12 +38,14 @@ export default function AttendanceReports() {
 
   async function fetchInitialData() {
     try {
-      // Get students from teacher's classes only
-      const { data: teacherClasses } = await dbHelpers.getClassesByTeacher(userProfile.firebase_id);
+      // Get teacher's classes
+      const { data: teacherClassesData } = await dbHelpers.getClassesByTeacher(userProfile.firebase_id);
+      setTeacherClasses(teacherClassesData || []);
 
+      // Get students from teacher's classes only
       let allStudents = [];
-      if (teacherClasses) {
-        for (const classItem of teacherClasses) {
+      if (teacherClassesData) {
+        for (const classItem of teacherClassesData) {
           const { data: classStudents } = await dbHelpers.getClassStudents(classItem.id);
           if (classStudents) {
             // Add class info to each student and avoid duplicates
@@ -89,9 +94,15 @@ export default function AttendanceReports() {
         userProfile.firebase_id // Filter by teacher
       );
 
-      // Filter by student if selected
+      // Apply additional filters
       if (filters.studentId) {
         attendanceData = attendanceData?.filter(record => record.student_id === filters.studentId);
+      }
+      if (filters.classId) {
+        attendanceData = attendanceData?.filter(record => record.class_id === parseInt(filters.classId));
+      }
+      if (filters.slotNumber) {
+        attendanceData = attendanceData?.filter(record => record.slot_number === parseInt(filters.slotNumber));
       }
 
       setReportData(attendanceData || []);
@@ -129,7 +140,9 @@ export default function AttendanceReports() {
     setFilters({
       startDate,
       endDate,
-      studentId: ''
+      studentId: '',
+      classId: '',
+      slotNumber: ''
     });
   }
 
@@ -263,7 +276,7 @@ export default function AttendanceReports() {
             </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 Start Date
@@ -275,7 +288,7 @@ export default function AttendanceReports() {
                 className="input-field"
               />
             </div>
-            
+
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 End Date
@@ -287,7 +300,25 @@ export default function AttendanceReports() {
                 className="input-field"
               />
             </div>
-            
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Class
+              </label>
+              <select
+                value={filters.classId}
+                onChange={(e) => handleFilterChange('classId', e.target.value)}
+                className="input-field"
+              >
+                <option value="">All Classes</option>
+                {teacherClasses.map(classItem => (
+                  <option key={classItem.id} value={classItem.id}>
+                    {classItem.name} ({classItem.subject})
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">
                 Student
@@ -305,7 +336,25 @@ export default function AttendanceReports() {
                 ))}
               </select>
             </div>
-            
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Slot
+              </label>
+              <select
+                value={filters.slotNumber}
+                onChange={(e) => handleFilterChange('slotNumber', e.target.value)}
+                className="input-field"
+              >
+                <option value="">All Slots</option>
+                {[1,2,3,4,5,6,7,8,9].map(slot => (
+                  <option key={slot} value={slot}>
+                    Slot {slot}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div className="flex items-end">
               <button
                 onClick={clearFilters}

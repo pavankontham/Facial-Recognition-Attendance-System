@@ -40,11 +40,11 @@ export default function TeacherAnalytics() {
   async function fetchAnalyticsData() {
     try {
       setLoading(true);
-      
+
       // Calculate date ranges
       const today = new Date();
       let startDate, endDate = today.toISOString().split('T')[0];
-      
+
       switch (timeRange) {
         case 'week':
           startDate = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
@@ -59,7 +59,40 @@ export default function TeacherAnalytics() {
           startDate = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
       }
 
-      // Get teacher's classes and students
+      // Use the new comprehensive analytics API
+      const { data: analyticsResponse, error } = await dbHelpers.getClassWiseAnalytics(
+        userProfile.firebase_id,
+        startDate,
+        endDate
+      );
+
+      if (error) {
+        console.error('Error fetching analytics:', error);
+        // Fallback to old method
+        await fetchAnalyticsDataFallback(startDate, endDate);
+        return;
+      }
+
+      if (analyticsResponse) {
+        const processedData = processNewAnalyticsData(analyticsResponse);
+        setAnalyticsData(processedData);
+      }
+
+    } catch (error) {
+      console.error('Error fetching analytics data:', error);
+      // Fallback to old method
+      const today = new Date();
+      const startDate = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const endDate = today.toISOString().split('T')[0];
+      await fetchAnalyticsDataFallback(startDate, endDate);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function fetchAnalyticsDataFallback(startDate, endDate) {
+    try {
+      // Get teacher's classes and students (fallback method)
       const { data: teacherClasses } = await dbHelpers.getClassesByTeacher(userProfile.firebase_id);
 
       // Get students enrolled in teacher's classes
@@ -81,10 +114,53 @@ export default function TeacherAnalytics() {
       setAnalyticsData(analytics);
 
     } catch (error) {
-      console.error('Error fetching analytics data:', error);
-    } finally {
-      setLoading(false);
+      console.error('Error in fallback analytics:', error);
     }
+  }
+
+  function processNewAnalyticsData(analyticsResponse) {
+    const { classes, overall_stats } = analyticsResponse;
+
+    // Convert class analytics to weekly stats format for charts
+    const weeklyStats = [];
+    const studentPerformance = [];
+
+    // Process each class for weekly view
+    classes.forEach(classData => {
+      classData.daily_breakdown.forEach(day => {
+        const existingDay = weeklyStats.find(w => w.date === day.date);
+        if (existingDay) {
+          existingDay.present += day.present;
+          existingDay.total += day.total;
+          existingDay.attendanceRate = Math.round((existingDay.present / existingDay.total) * 100);
+        } else {
+          weeklyStats.push({
+            date: day.date,
+            present: day.present,
+            total: day.total,
+            attendanceRate: day.rate,
+            day: new Date(day.date).toLocaleDateString('en-US', { weekday: 'short' })
+          });
+        }
+      });
+    });
+
+    // Sort weekly stats by date
+    weeklyStats.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    return {
+      weeklyStats,
+      monthlyStats: weeklyStats,
+      studentPerformance,
+      classBreakdown: classes, // New: detailed class breakdown
+      overallStats: {
+        totalStudents: overall_stats.total_students,
+        averageAttendance: overall_stats.overall_attendance_rate,
+        bestDay: overall_stats.best_performing_class?.name || 'N/A',
+        worstDay: overall_stats.worst_performing_class?.name || 'N/A',
+        totalClasses: overall_stats.total_classes
+      }
+    };
   }
 
   function processAnalyticsData(students, attendanceData, startDate, endDate) {
@@ -300,13 +376,93 @@ export default function TeacherAnalytics() {
           )}
         </div>
 
+        {/* Class-wise Breakdown */}
+        {analyticsData.classBreakdown && analyticsData.classBreakdown.length > 0 && (
+          <div className="card">
+            <div className="flex items-center mb-6">
+              <PieChart className="h-6 w-6 text-purple-600 mr-2" />
+              <h2 className="text-xl font-semibold text-gray-900">Class-wise Performance</h2>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+              {analyticsData.classBreakdown.map((classData) => (
+                <div key={classData.class_id} className="bg-gradient-to-br from-gray-50 to-gray-100 rounded-xl p-6 border border-gray-200">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-bold text-gray-900 text-lg">{classData.class_name}</h3>
+                    <span className={`px-3 py-1 rounded-full text-sm font-medium ${
+                      classData.attendance_rate >= 80 ? 'bg-green-100 text-green-800' :
+                      classData.attendance_rate >= 60 ? 'bg-yellow-100 text-yellow-800' :
+                      'bg-red-100 text-red-800'
+                    }`}>
+                      {classData.attendance_rate}%
+                    </span>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Subject:</span>
+                      <span className="font-medium text-gray-900">{classData.subject}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Enrolled Students:</span>
+                      <span className="font-medium text-blue-600">{classData.enrolled_students}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Total Records:</span>
+                      <span className="font-medium text-gray-900">{classData.total_records}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-gray-600">Present:</span>
+                      <span className="font-medium text-green-600">{classData.present_records}</span>
+                    </div>
+                  </div>
+
+                  <div className="mt-4">
+                    <div className="w-full bg-gray-200 rounded-full h-3">
+                      <div
+                        className={`h-3 rounded-full transition-all duration-500 ${
+                          classData.attendance_rate >= 80 ? 'bg-green-500' :
+                          classData.attendance_rate >= 60 ? 'bg-yellow-500' :
+                          'bg-red-500'
+                        }`}
+                        style={{ width: `${classData.attendance_rate}%` }}
+                      ></div>
+                    </div>
+                  </div>
+
+                  {/* Slot-wise breakdown */}
+                  <div className="mt-4">
+                    <h4 className="text-sm font-medium text-gray-700 mb-2">Slot Performance</h4>
+                    <div className="grid grid-cols-3 gap-1">
+                      {Object.entries(classData.slot_breakdown).map(([slotKey, slotData]) => {
+                        const slotNumber = slotKey.replace('slot_', '');
+                        return (
+                          <div key={slotKey} className="text-center">
+                            <div className="text-xs text-gray-600">S{slotNumber}</div>
+                            <div className={`text-xs font-medium ${
+                              slotData.rate >= 80 ? 'text-green-600' :
+                              slotData.rate >= 60 ? 'text-yellow-600' : 'text-red-600'
+                            }`}>
+                              {slotData.rate}%
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Student Performance */}
         <div className="card">
           <div className="flex items-center mb-4">
             <Users className="h-6 w-6 text-green-600 mr-2" />
             <h2 className="text-xl font-semibold text-gray-900">Student Performance</h2>
           </div>
-          
+
           {analyticsData.studentPerformance.length > 0 ? (
             <div className="space-y-3">
               {analyticsData.studentPerformance.slice(0, 10).map((student, index) => (
